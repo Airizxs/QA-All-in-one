@@ -20,6 +20,23 @@ DEFAULT_HEADERS: Dict[str, str] = {
 def build_session(headers: Optional[Dict[str, str]] = None) -> requests.Session:
     session = requests.Session()
     session.headers.update(headers or DEFAULT_HEADERS)
+    # Proxies from environment (HTTP(S)_PROXY)
+    proxies: Dict[str, str] = {}
+    http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if http_proxy:
+        proxies["http"] = http_proxy
+    if https_proxy:
+        proxies["https"] = https_proxy
+    if proxies:
+        session.proxies.update(proxies)
+    # SSL verification control: REQUESTS_CA_BUNDLE or disable via SEO_CHECKER_INSECURE
+    insecure = os.environ.get("SEO_CHECKER_INSECURE") == "1"
+    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
+    if insecure:
+        session.verify = False
+    elif ca_bundle:
+        session.verify = ca_bundle
     return session
 
 
@@ -48,4 +65,3 @@ def fetch_html(url: str, timeout: int = 20, use_scraperapi: bool = False, scrape
         return r.text
     except requests.RequestException:
         return None
-
