@@ -1,1 +1,1 @@
-# seo_checker
+# QA all in one
