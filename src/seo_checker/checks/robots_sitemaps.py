@@ -2,14 +2,16 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlparse
 from typing import Dict, List
 import requests
+from ..utils.fetch import build_session
 
-from fetch_utils import fetch_html, DEFAULT_HEADERS
+from ..utils.fetch import fetch_html, DEFAULT_HEADERS
 
 
 def _validate_sitemap(sitemap_url: str, timeout: int, use_scraperapi: bool) -> Dict:
     try:
-        # Use direct GET with headers to retrieve XML content (fetch_html returns text only)
-        r = requests.get(sitemap_url, headers=DEFAULT_HEADERS, timeout=timeout)
+        # Use a session with default headers/proxy/SSL settings
+        session = build_session(DEFAULT_HEADERS)
+        r = session.get(sitemap_url, timeout=timeout, allow_redirects=True)
         if r.status_code == 200:
             try:
                 ET.fromstring(r.content)
@@ -60,4 +62,3 @@ def check_robots_and_sitemaps(url: str, timeout: int = 20, use_scraperapi: bool 
         "warning" if validated else "fail"
     )
     return results
-
