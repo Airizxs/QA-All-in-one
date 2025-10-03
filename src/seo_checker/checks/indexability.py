@@ -2,7 +2,7 @@ from typing import Dict, Optional
 from bs4 import BeautifulSoup
 import requests
 
-from fetch_utils import build_session, DEFAULT_HEADERS
+from ..utils.fetch import build_session, DEFAULT_HEADERS
 
 
 def _parse_robots_directives(value: str) -> Dict[str, bool]:
@@ -47,4 +47,3 @@ def check_indexability(url: str, soup: BeautifulSoup, timeout: int = 10) -> Dict
     if result['status'] == 'pass' and not result['message']:
         result['message'] = 'Indexable (no noindex directives found).'
     return result
-

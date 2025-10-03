@@ -16,6 +16,7 @@ def check_schema(soup: BeautifulSoup) -> dict:
         'schema_found': False,
         'schemas': [],
         'types': [],
+        'urls': [],
         'authors': [],
         'faqpage_found': False,
     }
@@ -26,6 +27,9 @@ def check_schema(soup: BeautifulSoup) -> dict:
     if schema_tags:
         results['schema_found'] = True
         for tag in schema_tags:
+            src_attr = tag.get('src')
+            if src_attr:
+                results['urls'].append(src_attr)
             try:
                 # Attempt to parse the JSON content
                 schema_content = json.loads(tag.string)

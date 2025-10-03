@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seo-checker"
+version = "0.1.0"
+description = "SEO auditing CLI and Flask API for automated QA workflows."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Automated QA Team" }]
+dependencies = [
+    "Flask>=3.0,<4.0",
+    "beautifulsoup4>=4.12,<5.0",
+    "requests>=2.32,<3.0",
+    "gunicorn>=21.2,<22.0",
+    "rich>=13.7,<14.0",
+    "python-dotenv>=1.0,<2.0",
+    "openai>=1.14,<2.0",
+    "colorama>=0.4,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+seo-checker = "seo_checker.cli:console_entry"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["seo_checker*"]
