@@ -7,6 +7,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..utils.fetch import build_session, DEFAULT_HEADERS
 
 
+def _is_tel_link(href: str) -> bool:
+    return href.strip().lower().startswith("tel:")
+
+
 def is_internal(base_url: str, href: str) -> bool:
     href_url = urlparse(href)
     base_url_parsed = urlparse(base_url)
@@ -42,7 +46,10 @@ def check_internal_links(html: str, base_url: str, timeout: int = 20, max_links:
     soup = BeautifulSoup(html, 'html.parser')
     internal_links: Set[str] = set()
     for a in soup.find_all('a', href=True):
-        full = _normalize_link(base_url, a['href'])
+        href = a['href']
+        if _is_tel_link(href):
+            continue
+        full = _normalize_link(base_url, href)
         if is_internal(base_url, full):
             internal_links.add(full)
 
@@ -70,10 +77,13 @@ def check_internal_links(html: str, base_url: str, timeout: int = 20, max_links:
         parent = a_tag.find_parent(["p", "li", "article", "section"])
         return parent is not None
 
-    contextual_links = [
-        _normalize_link(base_url, a['href']) for a in soup.find_all('a', href=True)
-        if is_internal(base_url, _normalize_link(base_url, a['href'])) and is_in_context(a)
-    ]
+    contextual_links = []
+    for a in soup.find_all('a', href=True):
+        if _is_tel_link(a['href']):
+            continue
+        normalized = _normalize_link(base_url, a['href'])
+        if is_internal(base_url, normalized) and is_in_context(a):
+            contextual_links.append(normalized)
     contextual_count = len(set(contextual_links))
 
     status = "pass" if links_to_check and not broken and contextual_count >= 2 else (

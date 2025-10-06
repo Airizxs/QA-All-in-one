@@ -70,6 +70,17 @@ python -m seo_checker --help
 python -m seo_checker https://example.com --format both
 ```
 
+### Optional: Capture Puppeteer Screenshots
+
+Generate ready-to-paste summary graphics for Monday.com (title/meta, headings, schema, images, responsiveness):
+
+```bash
+npm install --save-dev puppeteer   # one-time setup
+python -m seo_checker https://example.com --format both --capture-screenshots
+```
+
+Screenshots land in `logs/screenshots/` with one PNG per section plus a composite responsiveness view.
+
 Within the command center choose the SEO audit option to either run the full checklist or target specific areas (title/meta, headings, schema, FAQ, mobile breakpoints, indexability, locations, addresses, hero image, robots/sitemaps, internal links, images, canonical, hreflang).
 
 Key options:

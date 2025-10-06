@@ -6,7 +6,8 @@ import re
 import threading
 import time
 import itertools
-from typing import Optional, Dict, Any, List, Set
+import subprocess
+from typing import Optional, Dict, Any, List, Set, Tuple
 from datetime import datetime, timezone
 
 # Silence urllib3's LibreSSL warning early (before importing requests/urllib3)
@@ -121,6 +122,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--insecure", action="store_true",
         help="Disable TLS verification (not recommended)."
+    )
+    parser.add_argument(
+        "--capture-screenshots",
+        action="store_true",
+        help="Capture Puppeteer screenshots (requires Node.js and tools/capture_sections.js).",
+    )
+    parser.add_argument(
+        "--screenshot-dir",
+        type=str,
+        default="logs/screenshots",
+        help="Directory for Puppeteer screenshots (default: logs/screenshots)",
+    )
+    parser.add_argument(
+        "--puppeteer-script",
+        type=str,
+        default="tools/capture_sections.js",
+        help="Override path to Puppeteer capture script.",
+    )
+    parser.add_argument(
+        "--screenshot-clip",
+        type=int,
+        default=1000,
+        help="Viewport height (px) captured for responsiveness composites.",
     )
     return parser.parse_args(argv)
 
@@ -302,6 +326,43 @@ def _print_table(title: str, headers: List[str], rows: List[List[Any]]):
             cell = colorize(val, status_hint) if status_hint else val
             colored_cells.append(_pad_visible(cell, widths[i]))
         print("| " + " | ".join(colored_cells) + " |")
+
+
+def _run_puppeteer_capture(script_path: str, url: str, output_dir: str, clip_height: int = 1000) -> Tuple[bool, str]:
+    script_full = os.path.abspath(script_path)
+    if not os.path.exists(script_full):
+        return False, f"Capture script not found at {script_full}"
+
+    output_full = os.path.abspath(output_dir)
+    cmd = [
+        "node",
+        script_full,
+        url,
+        "--output",
+        output_full,
+        "--clip",
+        str(max(400, clip_height)),
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=240,
+        )
+    except FileNotFoundError:
+        return False, "Node.js runtime not found; install Node to enable screenshots."
+    except subprocess.TimeoutExpired:
+        return False, "Puppeteer capture timed out."
+
+    if completed.returncode != 0:
+        combined = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+        return False, combined
+
+    message = completed.stdout.strip() or f"Screenshots saved to {output_full}"
+    return True, message
 
 
 def _collect_recommendations(result: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -884,6 +945,96 @@ def _clean_copy_value(value: Any) -> str:
     return " ".join(text.split())
 
 
+def _build_summary_paragraph(results: Dict[str, Any], url: str) -> str:
+    fragments: List[str] = []
+
+    fragments.append(f"SEO audit for {url} completed.")
+
+    tm = results.get('title_meta', {})
+
+    def _append_tm(label: str, key: str, *, include_length: bool = False) -> None:
+        item = tm.get(key, {}) if isinstance(tm, dict) else {}
+        if not isinstance(item, dict) or not item:
+            return
+        status = _status_text(item.get('status'))
+        if not status:
+            return
+        sentence = f"{label} {status}"
+        content = item.get('content')
+        message = _clean_copy_value(item.get('message'))
+        if include_length and content:
+            sentence += f" at {len(content)} chars"
+            content_text = _clean_copy_value(content)
+            if content_text:
+                sentence += f" (\"{content_text}\")"
+        elif key == 'author' and content:
+            sentence += f" ({_clean_copy_value(content)})"
+        elif message:
+            sentence += f" ({message})"
+        fragments.append(sentence + ".")
+
+    _append_tm("Title", "title", include_length=True)
+    _append_tm("Meta description", "meta_description", include_length=True)
+    _append_tm("Author", "author")
+
+    hero = results.get('hero_image', {})
+    if isinstance(hero, dict) and hero:
+        status = _status_text(hero.get('status'))
+        message = _clean_copy_value(hero.get('message'))
+        src = _clean_copy_value(hero.get('src'))
+        dims: List[str] = []
+        if hero.get('width'):
+            dims.append(str(hero.get('width')))
+        if hero.get('height'):
+            dims.append(str(hero.get('height')))
+        sentence = f"Hero image {status}" if status else "Hero image status unknown"
+        if dims:
+            sentence += f" ({'x'.join(dims)}px)"
+        if src:
+            sentence += f" from {src}"
+        if message:
+            sentence += f" – {message}"
+        fragments.append(sentence + ".")
+
+    il = results.get('internal_links', {})
+    if isinstance(il, dict) and il:
+        status = _status_text(il.get('status'))
+        broken = il.get('broken') or []
+        message = _clean_copy_value(il.get('message'))
+        checked = il.get('checked', 0)
+        total = il.get('total_internal', 0)
+        sentence = f"Internal links {status}" if status else "Internal links status unknown"
+        sentence += f" (checked {checked} of {total})"
+        if broken:
+            sentence += f" with {len(broken)} broken links"
+        if message:
+            sentence += f" – {message}"
+        fragments.append(sentence + ".")
+
+    idx = results.get('indexability', {})
+    if isinstance(idx, dict) and idx:
+        status = _status_text(idx.get('status'))
+        message = _clean_copy_value(idx.get('message'))
+        if status or message:
+            fragment = f"Indexability {status}" if status else "Indexability status unknown"
+            if message:
+                fragment += f" – {message}"
+            fragments.append(fragment + ".")
+
+    recs = _collect_recommendations(results)
+    if recs:
+        top_recs = recs[:3]
+        rec_text = "; ".join(
+            f"[{rec['status']}] {rec['area']}: {_clean_copy_value(rec['message'])}"
+            for rec in top_recs
+        )
+        if len(recs) > 3:
+            rec_text += "; additional action items logged"
+        fragments.append(f"Key follow-ups: {rec_text}.")
+
+    return " ".join(fragment.strip() for fragment in fragments if fragment).strip()
+
+
 def format_results_as_text(results: Dict[str, Any], url: str) -> str:
     lines: List[str] = []
     add = lines.append
@@ -892,17 +1043,6 @@ def format_results_as_text(results: Dict[str, Any], url: str) -> str:
     fetched = results.get('_fetched_at')
     if fetched:
         add(f"Fetched: {fetched}")
-
-    score_info = results.get('_score_summary') or {}
-    if score_info:
-        score = score_info.get('score')
-        max_score = score_info.get('max')
-        percent = score_info.get('percent')
-        result = score_info.get('result')
-        if percent is not None:
-            add(f"Overall Score: {percent:.1f}% ({score}/{max_score}) – {result}")
-        else:
-            add(f"Overall Score: {score}/{max_score} – {result}")
 
     section_scores = results.get('_section_scores') or {}
     if section_scores:
@@ -1091,15 +1231,6 @@ def print_results_as_text(results: Dict[str, Any], url: str) -> None:
     print(report)
 
 def print_results_as_tables(results: Dict[str, Any], url: str):
-    # Summary (score) if available
-    score_info = results.get('_score_summary')
-    if score_info:
-        _print_table(
-            "Summary",
-            ["Score", "Max", "Percent", "Result"],
-            [[score_info.get('score'), score_info.get('max'), f"{score_info.get('percent'):.1f}%", score_info.get('result')]],
-        )
-
     # Per-section scores (percent)
     section_scores = results.get('_section_scores')
     if section_scores:
@@ -1366,6 +1497,13 @@ def print_results_as_tables(results: Dict[str, Any], url: str):
 
     _print_recommendations(results)
 
+    summary = _build_summary_paragraph(results, url)
+    if summary:
+        if _rich_enabled():
+            _RICH_CONSOLE.print(Panel.fit(summary, title="Summary", border_style="cyan"))
+        else:
+            print("\nSummary:\n" + summary + "\n")
+
     # Spelling and AI sections removed
 
 def _append_history(history_path: str, entries: List[Dict[str, Any]]):
@@ -1510,6 +1648,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             print_results_as_tables(result, site_url)
         if not args.quiet and show_text and not is_child:
             print_results_as_text(result, site_url)
+
+        if args.capture_screenshots and not is_child:
+            ok, message = _run_puppeteer_capture(
+                args.puppeteer_script,
+                site_url,
+                args.screenshot_dir,
+                args.screenshot_clip,
+            )
+            if not args.quiet:
+                if ok:
+                    print(colorize(message, 'info'))
+                else:
+                    print(colorize(f"Puppeteer capture failed: {message}", 'warning'))
 
     if not args.quiet and len(outputs) == 2 and show_table:
         parent, child = outputs[0], outputs[1]
