@@ -7,6 +7,7 @@ import threading
 import time
 import itertools
 import subprocess
+import html
 from typing import Optional, Dict, Any, List, Set, Tuple
 from datetime import datetime, timezone
 
@@ -386,14 +387,6 @@ def _collect_recommendations(result: Dict[str, Any]) -> List[Dict[str, str]]:
             "status": (status or "").upper(),
             "message": message.strip(),
         })
-
-    summary = result.get('_score_summary', {})
-    if summary and summary.get('result') == 'FAIL':
-        add(
-            "Overall Score",
-            "fail",
-            f"Score {summary.get('percent', 0)}% is below the {summary.get('threshold', 80)}% threshold.",
-        )
 
     if result.get('error'):
         add("Fetch", "error", result.get('error'))
@@ -899,17 +892,25 @@ def compute_section_scores(res: Dict[str, Any]) -> Dict[str, float]:
 
     # Images: ratio based with poor-alt penalty
     im = res.get('images', {})
-    total_imgs = int(im.get('total_images') or 0)
-    missing_alt = len(im.get('missing_alt') or [])
-    if total_imgs == 0:
+    content_imgs = int(im.get('content_image_count') or 0)
+    issue_refs: Set[str] = set()
+    for ref in (im.get('content_missing_alt') or []):
+        if isinstance(ref, str) and ref:
+            issue_refs.add(ref)
+    for ref in (im.get('content_missing_title') or []):
+        if isinstance(ref, str) and ref:
+            issue_refs.add(ref)
+    issue_count = len(issue_refs)
+    if content_imgs == 0:
+        total_visible = int(im.get('total_images') or 0)
         total_found = int(im.get('total_found') or 0)
         hidden = int(im.get('skipped_hidden') or 0)
-        if total_found > 0 and hidden == total_found:
+        if total_visible == 0 and total_found > 0 and hidden == total_found:
             section_scores['images'] = 100.0
         else:
             section_scores['images'] = 0.0
     else:
-        section_scores['images'] = max(0.0, 100.0 * (1.0 - missing_alt / float(total_imgs)))
+        section_scores['images'] = max(0.0, 100.0 * (1.0 - issue_count / float(content_imgs)))
 
     # Indexability
     ix = res.get('indexability', {})
@@ -943,6 +944,445 @@ def _clean_copy_value(value: Any) -> str:
     if not text:
         return ""
     return " ".join(text.split())
+
+
+def _status_to_emoji(status: Optional[str]) -> str:
+    if not status:
+        return "⚠️"
+    normalized = str(status).strip().lower()
+    if normalized in _PASS_STATUSES:
+        return "✅"
+    if normalized in {"warn", "warning"}:
+        return "⚠️"
+    if normalized in {"info"}:
+        return "ℹ️"
+    return "❌"
+
+
+def _status_severity(status: Optional[str]) -> int:
+    if not status:
+        return 1
+    normalized = str(status).strip().lower()
+    if normalized in {"fail", "missing", "error", "no"}:
+        return 0
+    if normalized in {"warn", "warning"}:
+        return 1
+    return 2
+
+
+def _collect_qa_summary_rows(results: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    if not isinstance(results, dict):
+        return []
+
+    error_message = _clean_copy_value(results.get("error"))
+    if error_message:
+        safe_error = _clean_copy_value(error_message)
+        return [("Audit", "Fail", safe_error or "Request failed.")]
+
+    recommendations = _collect_recommendations(results)
+    rec_by_area: Dict[str, List[Dict[str, str]]] = {}
+    for rec in recommendations:
+        rec_by_area.setdefault(rec["area"], []).append(rec)
+
+    notes_map: Dict[str, List[str]] = {}
+
+    def append_notes(area: str, raw_notes: List[str]) -> None:
+        if not raw_notes:
+            return
+        existing = notes_map.get(area, [])
+        for note in raw_notes:
+            cleaned = _clean_copy_value(note)
+            if cleaned and cleaned not in existing:
+                existing.append(cleaned)
+        if existing:
+            notes_map[area] = existing
+
+    def _collect_item_notes(item: Dict[str, Any]) -> List[str]:
+        if not isinstance(item, dict):
+            return []
+        notes: List[str] = []
+        raw_notes = item.get("notes")
+        if isinstance(raw_notes, (list, tuple, set)):
+            notes.extend(str(n) for n in raw_notes if n)
+        elif raw_notes:
+            notes.append(str(raw_notes))
+        message = item.get("message")
+        status = (item.get("status") or "").strip().lower()
+        if message and (not status or status in _PASS_STATUSES):
+            notes.append(message)
+        return notes
+
+    def gather(area_keys: List[str]) -> Optional[Dict[str, Any]]:
+        matches: List[Dict[str, str]] = []
+        for key in area_keys:
+            matches.extend(rec_by_area.get(key, []))
+        if not matches:
+            return None
+        matches.sort(key=lambda rec: _status_severity(rec.get("status")))
+        status = matches[0].get("status")
+        # Preserve insertion order while removing duplicates
+        deduped_messages: Dict[str, None] = {}
+        for rec in matches:
+            message = _clean_copy_value(rec.get("message"))
+            if message:
+                deduped_messages[message] = None
+        message_text = "; ".join(deduped_messages.keys()) or _clean_copy_value(matches[0].get("message"))
+        return {
+            "status": status,
+            "message": message_text,
+        }
+
+    tm = results.get("title_meta", {}) or {}
+    append_notes("Title & Meta", _collect_item_notes(tm.get("title", {}) or {}))
+    append_notes("Title & Meta", _collect_item_notes(tm.get("meta_description", {}) or {}))
+
+    faq = results.get("faq", {}) or {}
+    append_notes("FAQ", _collect_item_notes(faq))
+
+    indexability = results.get("indexability", {}) or {}
+    append_notes("Indexability", _collect_item_notes(indexability))
+
+    canonical_bundle = results.get("canonical_hreflang", {}) or {}
+    canonical = canonical_bundle.get("canonical", {}) or {}
+    append_notes("Canonical", _collect_item_notes(canonical))
+
+    def success_title_meta() -> str:
+        return "Optimized and aligned with keywords"
+
+    def success_headings() -> str:
+        hd = results.get("headings", {}) or {}
+        parts: List[str] = []
+        h1_text = _clean_copy_value(hd.get("h1_content"))
+        if h1_text:
+            parts.append(f'H1 "{_truncate(h1_text, 72)}"')
+        hierarchy = hd.get("h_tags_found") or []
+        if hierarchy:
+            levels = ", ".join(str(level) for level in hierarchy[:6])
+            parts.append(f"levels {levels}")
+        detail = "; ".join(parts)
+        if detail:
+            return "Heading structure is in place"
+        return "Heading structure is in place"
+
+    def success_internal_links() -> str:
+        il = results.get("internal_links", {}) or {}
+        checked = int(il.get("checked") or 0)
+        contextual = int(il.get("contextual_links") or 0)
+        message_parts = [f"checked {checked} links with no broken URLs detected"]
+        if contextual:
+            message_parts.append(f"{contextual} contextual links found")
+        return "Internal linking validated"
+
+    def success_schema() -> str:
+        schema = results.get("schema", {}) or {}
+        types = schema.get("types") or []
+        unique_types = sorted({str(t) for t in types if t})
+        type_text = ", ".join(unique_types[:5])
+        block_count = len(schema.get("schemas") or [])
+        parts: List[str] = []
+        if block_count:
+            parts.append(f"{block_count} structured data block{'s' if block_count != 1 else ''}")
+        if type_text:
+            parts.append(f"types: {type_text}{'…' if len(unique_types) > 5 else ''}")
+        return "Schema markup present"
+
+    def success_images() -> str:
+        images = results.get("images", {}) or {}
+        pairs = images.get("content_images_with_alt_title") or []
+        previews: List[str] = []
+        for item in pairs:
+            if not isinstance(item, dict):
+                continue
+            alt_text = _clean_copy_value(item.get("alt"))
+            title_text = _clean_copy_value(item.get("title"))
+            snippet_parts: List[str] = []
+            if alt_text:
+                snippet_parts.append(f"alt: {alt_text}")
+            if title_text:
+                snippet_parts.append(f"title: {title_text}")
+            snippet = " | ".join(snippet_parts)
+            if snippet:
+                previews.append(snippet)
+            if len(previews) >= 3:
+                break
+        if previews:
+            preview_text = "; ".join(previews)
+            remaining = max(0, len(pairs) - len(previews))
+            if remaining > 0:
+                preview_text += "…"
+            return f"Photo alt/title pairs ok ({preview_text})"
+        message = _clean_copy_value(images.get("message"))
+        if message:
+            return message
+        total_visible = int(images.get("total_images") or 0)
+        return f"Audited {total_visible} images"
+
+    def success_mobile() -> str:
+        mobile = results.get("mobile_responsiveness", {}) or {}
+        message = _clean_copy_value(mobile.get("message"))
+        if message:
+            return message
+        breakpoints = (mobile.get("breakpoints") or {}).get("widths", {})
+        bp_parts = []
+        for label in ("mobile", "tablet", "desktop"):
+            widths = breakpoints.get(label, [])
+            if widths:
+                bp_parts.append(f"{label}: {', '.join(str(w) for w in widths[:3])}{'…' if len(widths) > 3 else ''}")
+        if bp_parts:
+            return "Responsive across key breakpoints"
+        return "Responsive across devices"
+
+    def success_faq() -> str:
+        if faq:
+            message = _clean_copy_value(faq.get("message"))
+            if message:
+                return message
+            if faq.get("status"):
+                return "FAQ content meets requirements"
+        return "FAQ section reviewed"
+
+    def success_indexability() -> str:
+        if indexability:
+            message = _clean_copy_value(indexability.get("message"))
+            if message:
+                return message
+        return "Index directives allow crawling"
+
+    def success_canonical() -> str:
+        canonical_url = _clean_copy_value(canonical.get("url"))
+        if canonical_url:
+            return f"Canonical points to {canonical_url}"
+        message = _clean_copy_value(canonical.get("message"))
+        if message:
+            return message
+        return "Canonical configuration reviewed"
+
+    section_map = [
+        ("Title & Meta", ["Title Tag", "Meta Description", "Author Meta"], success_title_meta),
+        ("Headings", ["H1 Heading", "Heading Hierarchy"], success_headings),
+        ("Internal Links", ["Internal Links"], success_internal_links),
+        ("Schema", ["Schema Markup"], success_schema),
+        ("Image Optimization", ["Images"], success_images),
+        ("Responsiveness", ["Mobile"], success_mobile),
+        ("FAQ", ["FAQ"], success_faq),
+        ("Indexability", ["Indexability"], success_indexability),
+        ("Canonical", ["Canonical"], success_canonical),
+    ]
+
+    rows: List[Tuple[str, str, str]] = []
+    area_alias = {
+        "Title & Meta": "Title & Meta",
+        "Headings": "Headings",
+        "Internal Links": "Internal Links",
+        "Schema": "Schema",
+        "Image Optimization": "Image Optimization",
+        "Responsiveness": "Responsiveness",
+        "FAQ": "FAQ",
+        "Indexability": "Indexability",
+        "Canonical": "Canonical",
+    }
+    def _normalize_sentences(parts: List[str]) -> List[str]:
+        normalized: List[str] = []
+        for part in parts:
+            text = _clean_copy_value(part)
+            if not text:
+                continue
+            if text.endswith(('.', '!', '?')):
+                normalized.append(text)
+            else:
+                normalized.append(f"{text}.")
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for text in normalized:
+            if text not in seen:
+                seen.add(text)
+                ordered.append(text)
+        return ordered
+
+    for label, rec_keys, success_fn in section_map:
+        rec_info = gather(rec_keys)
+        raw_section_notes = notes_map.get(label, [])
+        section_notes = _normalize_sentences(raw_section_notes)
+
+        if rec_info:
+            status_value = _clean_copy_value(rec_info.get("status")) or "fail"
+            pass_fail = "Pass" if status_value.lower() in _PASS_STATUSES else "Fail"
+            detail_parts = _normalize_sentences([rec_info.get("message", "")])
+        else:
+            pass_fail = "Pass"
+            detail_parts = _normalize_sentences([success_fn()])
+
+        detail_parts.extend(section_notes)
+        combined_detail = " ".join(detail_parts).strip()
+
+        display_area = area_alias.get(label, label)
+        rows.append((display_area, pass_fail, combined_detail or "-"))
+
+    return rows
+
+
+def _shorten_summary_detail(detail: str) -> str:
+    detail = (detail or "").strip()
+    if not detail:
+        return detail
+
+    has_url = any(token in detail for token in ("http://", "https://", "www."))
+
+    cut_idx: Optional[int] = None
+    if not has_url:
+        for sep in (". ", "; ", "! ", "? "):
+            idx = detail.find(sep)
+            if idx != -1:
+                cut_idx = idx
+                break
+    else:
+        # Keep the sentence containing the URL intact
+        url_idx = min(
+            (detail.find(token) for token in ("http://", "https://", "www.") if detail.find(token) != -1),
+            default=-1,
+        )
+        if url_idx == -1:
+            for sep in (". ", "; ", "! ", "? "):
+                idx = detail.find(sep)
+                if idx != -1:
+                    cut_idx = idx
+                    break
+        else:
+            for sep in (". ", "; ", "! ", "? "):
+                idx = detail.find(sep, url_idx)
+                if idx != -1:
+                    cut_idx = idx
+                    break
+
+    if cut_idx is not None:
+        detail = detail[:cut_idx]
+    else:
+        for end_sep in (".", ";", "!", "?"):
+            if detail.endswith(end_sep):
+                detail = detail[: -1]
+                break
+
+    max_len = 90
+    if len(detail) > max_len:
+        if has_url:
+            return detail.strip()
+        detail = detail[: max_len - 3].rstrip() + "..."
+    return detail.strip()
+
+
+def _build_qa_comment_lines(results: Dict[str, Any]) -> List[str]:
+    rows = _collect_qa_summary_rows(results)
+    if not rows:
+        return []
+
+    display_map = {
+        "Title & Meta": "Title and Meta",
+        "Headings": "Headings",
+        "Internal Links": "Internal Links",
+        "Schema": "Schema",
+        "Image Optimization": "Image",
+        "Responsiveness": "Responsive",
+        "FAQ": "FAQ",
+        "Indexability": "Indexability",
+        "Canonical": "Canonical",
+    }
+
+    pass_rows: List[Tuple[str, str]] = []
+    fail_rows: List[Tuple[str, str]] = []
+
+    for area, status, detail in rows:
+        label = display_map.get(area, area)
+        detail_clean = _clean_copy_value(detail)
+        status_lower = str(status).lower()
+        if status_lower in _PASS_STATUSES:
+            pass_rows.append((label, detail_clean or ""))
+        else:
+            fail_rows.append((label, detail_clean or "-"))
+
+    lines: List[str] = []
+
+    if pass_rows:
+        lines.append("✅ Passed")
+        for label, detail in pass_rows:
+            if detail and detail != "-":
+                short_detail = _shorten_summary_detail(detail)
+                if short_detail:
+                    lines.append(f"✅ | {label} - {short_detail}")
+                else:
+                    lines.append(f"✅ | {label}")
+            else:
+                lines.append(f"✅ | {label}")
+
+    if fail_rows:
+        if lines:
+            lines.append("")
+        lines.append("❌ Failed")
+        for label, detail in fail_rows:
+            lines.append(f"❌ | {label}")
+            if detail and detail != "-":
+                short_detail = _shorten_summary_detail(detail)
+                if short_detail:
+                    lines.append(f"Key Issues: {short_detail}")
+
+    return lines
+
+
+def _build_qa_summary_table(results: Dict[str, Any]) -> List[str]:
+    return []
+
+
+def _print_qa_comprehensive_summary(results: Dict[str, Any]) -> None:
+    rows = _collect_qa_summary_rows(results)
+    if not rows:
+        return
+
+    items_map = {
+        "Title & Meta": "Title, Meta Description, Author",
+        "Headings": "H1 Presence, Hierarchy",
+        "Internal Links": "Link Health, Contextual Coverage",
+        "Schema": "Structured Data Blocks",
+        "Image Optimization": "Alt Text, Visible Assets",
+        "Responsiveness": "Viewport Meta, Breakpoints",
+        "FAQ": "FAQ Headings, FAQPage schema",
+        "Indexability": "Robots Directives, X-Robots-Tag",
+        "Canonical": "Canonical Tag",
+    }
+
+    def _status_colors(status: str) -> str:
+        status_lower = status.lower()
+        if status_lower == "pass":
+            return "bold white on green"
+        if status_lower == "fail":
+            return "bold white on red"
+        return "bold white on dark_orange3"
+
+    if _rich_enabled():
+        table = Table(title="QA Comprehensive Summary", box=box.ROUNDED if box else None, header_style="bold cyan")
+        table.add_column("Category", style="bold")
+        table.add_column("Items Checked")
+        table.add_column("Result", justify="center")
+        table.add_column("Key Issues")
+
+        for area, status, detail in rows:
+            items = items_map.get(area, "-")
+            key_issues = detail if status.lower() not in _PASS_STATUSES else "-"
+            status_style = _status_colors(status)
+            table.add_row(area, items, f"[{status_style}]{status}[/{status_style}]", key_issues)
+
+        _RICH_CONSOLE.print(table)
+        return
+
+    print("\nQA Comprehensive Summary")
+    header = f"{'Category':20} | {'Items Checked':30} | {'Result':10} | Key Issues"
+    print(header)
+    print("-" * len(header))
+    for area, status, detail in rows:
+        items = items_map.get(area, "-")
+        key_issues = detail if status.lower() not in _PASS_STATUSES else "-"
+        print(f"{area:20} | {items:30} | {status:10} | {key_issues}")
+
+
+
 
 
 def _build_summary_paragraph(results: Dict[str, Any], url: str) -> str:
@@ -1039,204 +1479,32 @@ def format_results_as_text(results: Dict[str, Any], url: str) -> str:
     lines: List[str] = []
     add = lines.append
 
-    add(f"URL: {url}")
+    add("# SEO Audit Report")
+    add("")
+    add(f"**URL:** {url}")
     fetched = results.get('_fetched_at')
     if fetched:
-        add(f"Fetched: {fetched}")
+        add(f"**Fetched:** {fetched}")
 
-    section_scores = results.get('_section_scores') or {}
-    if section_scores:
+    qa_comment_lines = _build_qa_comment_lines(results)
+    if qa_comment_lines:
         add("")
-        add("Section Scores")
-        ordered_keys = [
-            'title_meta', 'headings', 'schema', 'faq', 'mobile', 'robots', 'sitemaps',
-            'internal_links', 'images', 'indexability', 'canonical', 'hreflang', 'locations', 'hero_image'
-        ]
-        for key in ordered_keys:
-            if key in section_scores:
-                label = key.replace('_', ' ').title()
-                add(f"- {label}: {section_scores[key]:.1f}%")
+        add("## QA Comment")
+        lines.extend(qa_comment_lines)
 
-    tm = results.get('title_meta', {})
-    if tm:
-        add("")
-        add("Title & Meta")
-        title = tm.get('title', {}) or {}
-        title_detail = title.get('content') or title.get('message') or ''
-        if title.get('content'):
-            title_detail = f"\"{_clean_copy_value(title['content'])}\" ({len(title['content']):d} chars)"
-        add(f"- Title: {_status_text(title.get('status'))} | { _clean_copy_value(title_detail) or 'No title found.'}")
+    return "\n".join(lines)
 
-        meta = tm.get('meta_description', {}) or {}
-        meta_detail = meta.get('content') or meta.get('message') or ''
-        if meta.get('content'):
-            meta_detail = f"\"{_clean_copy_value(meta['content'])}\" ({len(meta['content']):d} chars)"
-        add(f"- Meta Description: {_status_text(meta.get('status'))} | { _clean_copy_value(meta_detail) or 'No meta description found.'}")
-
-        author = tm.get('author', {}) or {}
-        author_detail = author.get('content') or author.get('message') or ''
-        add(f"- Author: {_status_text(author.get('status'))} | { _clean_copy_value(author_detail) or 'No author meta tag detected.'}")
-
-    hd = results.get('headings', {})
-    if hd:
-        add("")
-        add("Headings")
-        add(f"- H1: {_status_text(hd.get('h1_status'))} | {_clean_copy_value(hd.get('h1_content')) or 'No H1 found.'}")
-        hierarchy_details = hd.get('h_hierarchy_message') or (
-            f"Levels: {', '.join(str(lvl) for lvl in hd.get('h_tags_found', []))}" if hd.get('h_tags_found') else ''
-        )
-        add(f"- Hierarchy: {_status_text(hd.get('h_hierarchy'))} | {_clean_copy_value(hierarchy_details) or 'Hierarchy issues detected.'}")
-
-    sc = results.get('schema', {})
-    if sc:
-        add("")
-        add("Schema")
-        schema_status = _status_text('pass' if sc.get('schema_found') else 'fail')
-        types = ', '.join(sorted({str(t) for t in sc.get('types', [])}))
-        add(f"- Structured Data: {schema_status} | Types: {_clean_copy_value(types) or 'None'}")
-        url_rows = sc.get('urls') or []
-        if url_rows:
-            add(f"- Script URLs: {', '.join(url_rows[:5])}{'…' if len(url_rows) > 5 else ''}")
-
-    faq = results.get('faq', {})
-    if faq:
-        add("")
-        add("FAQ")
-        add(f"- Status: {_status_text(faq.get('status'))} | {_clean_copy_value(faq.get('message')) or 'No FAQ notes.'}")
-        add(f"- H3 Count: {faq.get('h3_count', 0)}")
-        add(f"- H5 Count: {faq.get('h5_count', 0)}")
-
-    mobile = results.get('mobile_responsiveness', {})
-    if mobile:
-        add("")
-        add("Mobile Responsiveness")
-        add(f"- Status: {_status_text(mobile.get('status'))} | {_clean_copy_value(mobile.get('message')) or 'No mobile warnings.'}")
-        breakpoints = (mobile.get('breakpoints') or {}).get('widths', {})
-        if breakpoints:
-            bp_parts = []
-            for label in ('mobile', 'tablet', 'desktop'):
-                widths = breakpoints.get(label, [])
-                if widths:
-                    bp_parts.append(f"{label}: {', '.join(str(w) for w in widths[:4])}{'…' if len(widths) > 4 else ''}")
-            if bp_parts:
-                add(f"- Breakpoints: {' | '.join(bp_parts)}")
-
-    idx = results.get('indexability', {})
-    if idx:
-        add("")
-        add("Indexability")
-        add(f"- Status: {_status_text(idx.get('status'))} | {_clean_copy_value(idx.get('message')) or 'No indexability warnings.'}")
-        add(f"- Meta Robots: {_clean_copy_value(idx.get('meta_robots')) or '-'}")
-        add(f"- X-Robots-Tag: {_clean_copy_value(idx.get('x_robots_tag')) or '-'}")
-
-    robots = (results.get('robots_sitemaps') or {}).get('robots', {})
-    sitemaps = (results.get('robots_sitemaps') or {}).get('sitemaps', {})
-    add("")
-    add("Robots & Sitemaps")
-    add(f"- Robots.txt: {'Present' if robots.get('present') else 'Missing'} | {_clean_copy_value(robots.get('url')) or 'No URL recorded.'}")
-    add(f"- Sitemaps Status: {_status_text(sitemaps.get('status'))} | {_clean_copy_value(sitemaps.get('message')) or 'No sitemap message.'}")
-    validated = sitemaps.get('validated') or []
-    if validated:
-        urls = [v.get('sitemap_url') for v in validated[:5] if v.get('sitemap_url')]
-        if urls:
-            add(f"- Sitemap URLs: {', '.join(urls)}{', …' if len(validated) > 5 else ''}")
-
-    il = results.get('internal_links', {})
-    if il:
-        add("")
-        add("Internal Links")
-        add(
-            f"- Status: {_status_text(il.get('status'))} | Checked {il.get('checked', 0)} of {il.get('total_internal', 0)} links; context links: {il.get('contextual_links', 0)}"
-        )
-        add(f"- Notes: {_clean_copy_value(il.get('message')) or 'No internal link issues.'}")
-        broken = il.get('broken') or []
-        if broken:
-            preview = ', '.join(broken[:5])
-            if len(broken) > 5:
-                preview += ', …'
-            add(f"- Broken Links: {preview}")
-
-    images = results.get('images', {})
-    if images:
-        add("")
-        add("Images")
-        total_visible = images.get('total_images', 0)
-        skipped_hidden = images.get('skipped_hidden', 0)
-        add(f"- Status: {_status_text(images.get('status'))} | {_clean_copy_value(images.get('message')) or 'No image issues.'}")
-        add(f"- Visible Images Audited: {total_visible}")
-        if skipped_hidden:
-            add(f"- Hidden/Lazy Images Skipped: {skipped_hidden}")
-        miss_with_title = images.get('missing_alt_with_title') or []
-        if miss_with_title:
-            preview = ', '.join(miss_with_title[:5]) + ('…' if len(miss_with_title) > 5 else '')
-            add(f"- Missing alt (image has title attribute): {preview}")
-
-    ch = results.get('canonical_hreflang', {})
-    canonical = ch.get('canonical', {}) if isinstance(ch, dict) else {}
-    hreflang = ch.get('hreflang', {}) if isinstance(ch, dict) else {}
-    add("")
-    add("Canonical & Hreflang")
-    add(f"- Canonical: {_status_text(canonical.get('status'))} | {_clean_copy_value(canonical.get('url')) or 'No canonical tag found.'}")
-    add(f"- Notes: {_clean_copy_value(canonical.get('message')) or 'No canonical warnings.'}")
-    hre_entries = hreflang.get('entries') or []
-    if hre_entries:
-        preview = ', '.join(f"{entry.get('lang')}: {entry.get('url')}" for entry in hre_entries[:5])
-        if len(hre_entries) > 5:
-            preview += ', …'
-        add(f"- Hreflang Entries: {preview}")
-    else:
-        add(f"- Hreflang: {_status_text(hreflang.get('status'))} | {_clean_copy_value(hreflang.get('message')) or 'No hreflang tags present.'}")
-
-    locations = results.get('locations', {})
-    if locations:
-        add("")
-        add("Locations")
-        add(f"- Status: {_status_text(locations.get('status'))} | {_clean_copy_value(locations.get('message')) or 'No location issues.'}")
-        addresses = locations.get('addresses') or []
-        if addresses:
-            preview = '; '.join(addresses[:5])
-            if len(addresses) > 5:
-                preview += '; …'
-            add(f"- Addresses: {preview}")
-
-    hero = results.get('hero_image', {})
-    if hero:
-        add("")
-        add("Hero Image")
-        add(f"- Status: {_status_text(hero.get('status'))} | {_clean_copy_value(hero.get('message')) or 'Hero image is configured correctly.'}")
-        hero_src = hero.get('src')
-        if hero_src:
-            add(f"- Source: {hero_src}")
-        hero_size = []
-        if hero.get('width'):
-            hero_size.append(str(hero.get('width')))
-        if hero.get('height'):
-            hero_size.append(str(hero.get('height')))
-        if hero_size:
-            add(f"- Dimensions: {'x'.join(hero_size)}")
-
-    recommendations = _collect_recommendations(results)
-    if recommendations:
-        add("")
-        add("Action Items")
-        for rec in recommendations:
-            add(f"- [{rec['status'].upper()}] {rec['area']}: {_clean_copy_value(rec['message'])}")
-
-    return "\n".join(lines).rstrip() + "\n"
 
 
 def print_results_as_text(results: Dict[str, Any], url: str) -> None:
     report = format_results_as_text(results, url)
-    print("\n=== Copy-Friendly Audit Report ===")
+    print("\n## Copy-Friendly Audit Report\n")
     print(report)
 
 def print_results_as_tables(results: Dict[str, Any], url: str):
-    # Per-section scores (percent)
-    section_scores = results.get('_section_scores')
-    if section_scores:
-        rows = [[k.replace('_', ' ').title(), f"{v:.1f}%"] for k, v in section_scores.items()]
-        _print_table("Section Scores", ["Item", "Percent"], rows)
+    _print_qa_comprehensive_summary(results)
 
+    # Per-section scores (percent)
     # Title & Meta
     tm = results.get('title_meta', {})
     _print_table(
@@ -1303,22 +1571,29 @@ def print_results_as_tables(results: Dict[str, Any], url: str):
         )
     # FAQ
     faq = results.get('faq', {})
+    other_levels = ", ".join(
+        f"{tag.upper()}({count})"
+        for tag, count in sorted((faq.get('non_h3_counts') or {}).items())
+        if count > 0
+    ) or "-"
     _print_table(
         "FAQ",
-        ["H3 Present", "H5 Present", "Schema FAQPage", "Status", "Message"],
+        ["Detected", "H3 Count", "Other Levels", "Schema FAQPage", "Status", "Message"],
         [[
-            "yes" if faq.get('h3_count', 0) > 0 else "no",
-            "yes" if faq.get('h5_count', 0) > 0 else "no",
+            "yes" if faq.get('faq_detected') else "no",
+            faq.get('h3_count', 0),
+            other_levels,
             "yes" if sc.get('faqpage_found') else "no",
             faq.get('status', ''),
             _truncate(faq.get('message', '')),
         ]],
     )
-    if faq.get('h5_examples'):
+    non_h3_examples = faq.get('non_h3_examples') or []
+    if non_h3_examples:
         _print_table(
-            "FAQ H5 Examples",
+            "FAQ Non-H3 Examples",
             ["Heading Text"],
-            [[_truncate(text, 120)] for text in faq.get('h5_examples', [])[:10]],
+            [[_truncate(text, 120)] for text in non_h3_examples[:10]],
         )
 
     # Mobile
@@ -1430,27 +1705,49 @@ def print_results_as_tables(results: Dict[str, Any], url: str):
             "Broken Internal Links",
             ["Link"],
             [[_truncate(link, 120)] for link in il.get('broken', [])[:20]],
-        )
+    )
 
     # Images
     im = results.get('images', {})
-    total_imgs = int(im.get('total_images') or 0)
-    miss_ct = len(im.get('missing_alt') or [])
-    if total_imgs == 0:
+    content_total = int(im.get('content_image_count') or 0)
+    visible_total = int(im.get('total_images') or 0)
+    issue_refs: Set[str] = set()
+    for ref in (im.get('content_missing_alt') or []):
+        if isinstance(ref, str) and ref:
+            issue_refs.add(ref)
+    for ref in (im.get('content_missing_title') or []):
+        if isinstance(ref, str) and ref:
+            issue_refs.add(ref)
+    issue_count = len(issue_refs)
+    if content_total == 0:
         total_found = int(im.get('total_found') or 0)
         hidden = int(im.get('skipped_hidden') or 0)
-        img_percent = 100.0 if total_found > 0 and hidden == total_found else 0.0
+        img_percent = 100.0 if visible_total == 0 and total_found > 0 and hidden == total_found else 0.0
     else:
-        img_percent = 100.0 * (1.0 - miss_ct / float(total_imgs))
+        img_percent = 100.0 * (1.0 - issue_count / float(content_total))
+    filtered = int(im.get('decorative_images_filtered') or 0)
+    message = _truncate(im.get('message', ''))
+    if filtered:
+        extra_note = f"Filtered {filtered} decorative image(s)."
+        message = f"{message} {extra_note}".strip()
     _print_table(
         "Images",
-        ["Total", "Status", "Percent", "Message"],
-        [[total_imgs, im.get('status', ''), f"{img_percent:.0f}%", _truncate(im.get('message', ''))]],
+        ["Content", "Visible", "Status", "Percent", "Message"],
+        [[content_total, visible_total, im.get('status', ''), f"{img_percent:.0f}%", message]],
     )
     # Combine all alt-related issues into a single table
     issues_rows: List[List[str]] = []
+    missing_with_title = set()
     for src in (im.get('missing_alt_with_title') or [])[:20]:
-        issues_rows.append(["Missing alt (has title)", _truncate(src, 120)])
+        if isinstance(src, str):
+            missing_with_title.add(src)
+            issues_rows.append(["Missing alt (has title)", _truncate(src, 120)])
+    for src in (im.get('content_missing_alt') or [])[:20]:
+        if isinstance(src, str) and src not in missing_with_title:
+            issues_rows.append(["Missing alt", _truncate(src, 120)])
+    for src in (im.get('content_missing_title') or [])[:20]:
+        if isinstance(src, str):
+            issues_rows.append(["Missing title", _truncate(src, 120)])
     if issues_rows:
         _print_table(
             "Image Alt Issues",
@@ -1496,13 +1793,6 @@ def print_results_as_tables(results: Dict[str, Any], url: str):
         )
 
     _print_recommendations(results)
-
-    summary = _build_summary_paragraph(results, url)
-    if summary:
-        if _rich_enabled():
-            _RICH_CONSOLE.print(Panel.fit(summary, title="Summary", border_style="cyan"))
-        else:
-            print("\nSummary:\n" + summary + "\n")
 
     # Spelling and AI sections removed
 
@@ -1560,26 +1850,7 @@ def _show_history(history_path: str, limit: int = 20):
             f"{secs.get('locations', 0):.0f}%",
         ])
     if sec_rows:
-        _print_table(
-            "History Section Scores",
-            [
-                "Timestamp",
-                "URL",
-                "Title/Meta",
-                "Headings",
-                "Schema",
-                "Mobile",
-                "Robots",
-                "Sitemaps",
-                "Internal",
-                "Images",
-                "Index",
-                "Canonical",
-                "Hreflang",
-                "Locations",
-            ],
-            sec_rows,
-        )
+        pass
 
 
 
@@ -1742,6 +2013,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             entry.get('sitemap_url', '')
                             for entry in robots.get('sitemaps', {}).get('validated', [])
                         ]
+                    
                     ),
                 ])
 

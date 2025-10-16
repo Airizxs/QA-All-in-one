@@ -18,6 +18,15 @@ _HIDDEN_CLASS_HINTS = {
     'screen-reader-only',
     'aria-hidden',
 }
+_LOGO_KEYWORDS = {
+    'logo',
+    'favicon',
+    'icon',
+    'brandmark',
+    'wordmark',
+    'lockup',
+    'mark',
+}
 
 
 def _extract_display_size(img) -> Optional[str]:
@@ -107,6 +116,25 @@ def _is_hidden_image(img) -> bool:
     return False
 
 
+def _is_logo_like(img, alt_text: Optional[str], title_text: Optional[str], src_text: Optional[str]) -> bool:
+    candidates: List[str] = []
+    if alt_text:
+        candidates.append(alt_text.lower())
+    if title_text:
+        candidates.append(title_text.lower())
+    if src_text:
+        candidates.append(src_text.lower())
+    classes = img.get('class')
+    if isinstance(classes, (list, tuple, set)):
+        candidates.extend(str(cls).lower() for cls in classes if cls)
+    elif isinstance(classes, str):
+        candidates.extend(token.lower() for token in classes.split() if token)
+    if not candidates:
+        return False
+    blob = " ".join(candidates)
+    return any(keyword in blob for keyword in _LOGO_KEYWORDS)
+
+
 def check_images(
     soup: BeautifulSoup,
     base_url: Optional[str] = None,
@@ -123,6 +151,12 @@ def check_images(
     missing_no_title: List[str] = []
     missing_with_title: List[str] = []
     size_info: List[Dict[str, Any]] = []
+    image_titles: List[str] = []
+    content_images_info: List[Dict[str, Optional[str]]] = []
+    content_missing_alt: List[str] = []
+    content_missing_title: List[str] = []
+    content_with_alt_title: List[Dict[str, Optional[str]]] = []
+    decorative_skipped = 0
 
     session = build_session() if fetch_sizes else None
 
@@ -134,16 +168,44 @@ def check_images(
         visible_count += 1
         alt = img.get('alt')
         alt_text = (str(alt).strip() if isinstance(alt, str) else None)
-        if not alt_text:
-            src_val = img.get('src') or img.get('data-src') or img.get('srcset') or ''
-            src_str = src_val if isinstance(src_val, str) else str(src_val)
-            title_attr = img.get('title')
-            has_title = bool(title_attr and str(title_attr).strip())
-            if has_title:
-                missing.append(src_str)
-                missing_with_title.append(src_str)
-            else:
-                missing_no_title.append(src_str)
+        title_attr = img.get('title')
+        title_text = (str(title_attr).strip() if isinstance(title_attr, str) else None)
+
+        src_val = img.get('src') or img.get('data-src') or img.get('srcset') or ''
+        src_str = src_val if isinstance(src_val, str) else str(src_val)
+        src_reference = src_str.strip()
+        if isinstance(src_reference, str) and ',' in src_reference:
+            src_reference = src_reference.split(',')[0].strip()
+        if not src_reference:
+            src_reference = alt_text or title_text or ''
+        if not src_reference:
+            src_reference = '[image]'
+
+        is_logo = _is_logo_like(img, alt_text, title_text, src_str if isinstance(src_str, str) else None)
+
+        if not is_logo:
+            content_info = {
+                'alt': alt_text,
+                'title': title_text,
+                'src': src_reference,
+            }
+            content_images_info.append(content_info)
+            if alt_text and title_text:
+                content_with_alt_title.append(content_info)
+            if title_text:
+                image_titles.append(title_text)
+
+            if not alt_text:
+                missing.append(src_reference)
+                if title_text:
+                    missing_with_title.append(src_reference)
+                else:
+                    missing_no_title.append(src_reference)
+                content_missing_alt.append(src_reference)
+            if not title_text:
+                content_missing_title.append(src_reference)
+        else:
+            decorative_skipped += 1
 
         if fetch_sizes and session and base_url and len(size_info) < max_fetch:
             raw_src = img.get('src') or (img.get('data-src') if isinstance(img.get('data-src'), str) else None)
@@ -168,15 +230,21 @@ def check_images(
             status = 'pass'
             message = f'Skipped {hidden_skipped} hidden or non-visible image(s); nothing visible to audit.'
     else:
-        if not missing:
+        content_count = len(content_images_info)
+        if content_count == 0:
+            status = 'warning'
+            message = 'Only logo or decorative images detected; add descriptive photos with alt/title.'
+        elif not content_missing_alt and not content_missing_title:
             status = 'pass'
-            if len(missing_no_title) > 0:
-                message = f'All {visible_count} visible images include alt text or lack a title attribute.'
-            else:
-                message = f'All {visible_count} visible images include alt text.'
+            message = f'All {content_count} content images include alt and title text.'
         else:
             status = 'warning'
-            message = f'{len(missing)} image(s) have a title attribute but missing alt text.'
+            parts: List[str] = []
+            if content_missing_alt:
+                parts.append(f'{len(content_missing_alt)} content image(s) missing alt text')
+            if content_missing_title:
+                parts.append(f'{len(content_missing_title)} content image(s) missing title text')
+            message = '; '.join(parts) + '.'
 
     oversized_threshold = 500 * 1024  # 500KB default heuristic
     oversized_count = sum(1 for it in size_info if (it.get('bytes') or 0) > oversized_threshold)
@@ -193,5 +261,12 @@ def check_images(
         'sizes': size_info,
         'oversized_count': oversized_count,
         'oversized_threshold_bytes': oversized_threshold,
+        'content_images': content_images_info[:50],
+        'content_images_with_alt_title': content_with_alt_title[:50],
+        'content_missing_alt': content_missing_alt[:50],
+        'content_missing_title': content_missing_title[:50],
+        'content_image_count': len(content_images_info),
+        'decorative_images_filtered': decorative_skipped,
         'message': message,
+        'image_titles': image_titles[:50],
     }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 try:
@@ -94,16 +95,22 @@ def _print_schema(results: Dict[str, Dict]) -> None:
 
 def _print_faq(results: Dict[str, Dict]) -> None:
     faq = results.get("faq", {})
+    other_levels = ", ".join(
+        f"{tag.upper()}({count})"
+        for tag, count in sorted((faq.get("non_h3_counts") or {}).items())
+        if count > 0
+    ) or "-"
     rows = [[
-        "H3 Count",
+        "yes" if faq.get("faq_detected") else "no",
         faq.get("h3_count", 0),
+        other_levels,
         faq.get("status", ""),
-        faq.get("message", ""),
+        faq.get("message", "") or "",
     ]]
-    rows.append(["H5 Count", faq.get("h5_count", 0), "", ""]) 
-    _render_table("FAQ", ["Metric", "Value", "Status", "Notes"], rows)
-    if faq.get("h5_examples"):
-        _render_table("FAQ H5 Examples", ["Heading"], [[text] for text in faq.get("h5_examples", [])[:10]])
+    _render_table("FAQ", ["Detected", "H3 Count", "Other Levels", "Status", "Message"], rows)
+    non_h3_examples = faq.get("non_h3_examples") or []
+    if non_h3_examples:
+        _render_table("FAQ Non-H3 Examples", ["Heading"], [[text] for text in non_h3_examples[:10]])
 
 
 def _print_mobile(results: Dict[str, Dict]) -> None:
@@ -205,13 +212,22 @@ def _print_images(results: Dict[str, Dict]) -> None:
     images = results.get("images", {})
     rows = [[
         images.get("status", ""),
+        images.get("content_image_count", 0),
         images.get("total_images", 0),
         images.get("message", "") or ""
     ]]
-    _render_table("Images", ["Status", "Total", "Message"], rows)
+    _render_table("Images", ["Status", "Content", "Visible", "Message"], rows)
     src_rows = []
+    missing_with_title = set()
     for src in (images.get("missing_alt_with_title") or [])[:10]:
         src_rows.append(["Missing alt (has title)", src])
+        if isinstance(src, str):
+            missing_with_title.add(src)
+    for src in (images.get("content_missing_alt") or [])[:10]:
+        if isinstance(src, str) and src not in missing_with_title:
+            src_rows.append(["Missing alt", src])
+    for src in (images.get("content_missing_title") or [])[:10]:
+        src_rows.append(["Missing title", src])
     if src_rows:
         _render_table("Image Issues", ["Issue", "Reference"], src_rows)
 
@@ -262,6 +278,22 @@ SECTION_MAP_WITH_ADDRESS["ADDRESSES"] = {
 }
 
 
+def _capture_screenshot_bundle(url: str) -> None:
+    """Capture SEO summary panels and a full-page screenshot via Puppeteer."""
+    project_root = Path(__file__).resolve().parents[2]
+    script_path = project_root / "tools" / "capture_sections.js"
+    if not script_path.exists():
+        print("Screenshot script not found at tools/capture_sections.js. Install it to enable captures.\n")
+        return
+
+    print("Capturing screenshots (SEO panels + full page). This may take a moment...\n")
+    ok, message = cli._run_puppeteer_capture(str(script_path), url, "logs/screenshots", 1000)
+    if ok:
+        print(f"{message}\n")
+    else:
+        print(f"Puppeteer capture failed: {message}\n")
+
+
 def run_audit_flow() -> None:
     url = _text_prompt("Enter the URL to audit (leave blank to cancel): ").strip()
     if not url:
@@ -295,6 +327,7 @@ def run_audit_flow() -> None:
     if 1 in choices or not choices:
         cli.print_results_as_tables(results, url)
         cli.print_results_as_text(results, url)
+        _capture_screenshot_bundle(url)
         return
 
     max_choice = len(keys) + 1
@@ -308,3 +341,4 @@ def run_audit_flow() -> None:
         SECTION_MAP_WITH_ADDRESS[key]['render'](results)
 
     cli._print_recommendations(results)
+    _capture_screenshot_bundle(url)
